@@ -6,7 +6,7 @@
     "build": "next build --no-lint",
     "dev": "next dev",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint ."
   },
   "dependencies": {
     "framer-motion": "^12.23.12",
@@ -27,12 +27,12 @@
     "eslint-config-next": "15.5.2",
     "tailwindcss": "^4",
     "typescript": "^5"
-  }
+  },
   "pnpm": {
-  "onlyBuiltDependencies": [
-    "@tailwindcss/oxide",
-    "sharp",
-    "unrs-resolver"
-  ]
+    "onlyBuiltDependencies": [
+      "@tailwindcss/oxide",
+      "sharp",
+      "unrs-resolver"
+    ]
   }
 }
