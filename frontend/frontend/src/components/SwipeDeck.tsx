@@ -1,12 +1,21 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { motion, useMotionValue, useTransform, AnimatePresence, type PanInfo } from 'framer-motion';
+import {
+  motion,
+  useMotionValue,
+  useTransform,
+  AnimatePresence,
+  type PanInfo,
+  type Variants,
+  type Easing,
+} from 'framer-motion';
 import Image from 'next/image';
 import { api } from '@/lib/api';
 
 // ---------- Types ----------
 type Photo = { id: string; url: string; order: number };
+
 type Candidate = {
   id: string;
   email: string;
@@ -15,313 +24,329 @@ type Candidate = {
     age?: number | null;
     gender?: string | null;
     bio?: string | null;
-    interests: string[];
-    institution?: string | null;
+    city?: string | null;
+    jobTitle?: string | null;
+    company?: string | null;
+    education?: string | null;
+    heightCm?: number | null;
+    interests?: string[] | null;
+    photos?: Photo[] | null;
   } | null;
-  photos: Photo[];
+  photos?: Photo[] | null; // some backends keep photos here
 };
 
-// Section content subtypes
-type SectionContentText = { body?: string };
-type SectionContentGallery = { images?: string[] };
-type SectionContentCardItem = { image?: string; text?: string };
-type SectionContentCard = { items?: SectionContentCardItem[] };
-
-// Section union
-type Section = {
-  id: string;
-  title: string;
-  type: 'text' | 'qa' | 'gallery' | 'links' | 'card' | string;
-  content?: SectionContentText | SectionContentGallery | SectionContentCard | Record<string, unknown>;
-  order: number;
+type SwipeDeckProps = {
+  cards: Candidate[];
+  token: string;
+  onEmpty?: () => void;
+  onSwiped?: (payload: { id: string; direction: 'left' | 'right' }) => void;
 };
 
-// ---------- Page transition variants ----------
-const pageVariants = {
+// ---------- Helpers ----------
+function bestPhoto(c: Candidate): string | undefined {
+  const list = (c.profile?.photos ?? c.photos ?? []) as Photo[];
+  if (!list || list.length === 0) return undefined;
+  const sorted = [...list].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  return sorted[0]?.url;
+}
+
+function cmToFeetInches(cm?: number | null): string | undefined {
+  if (!cm) return undefined;
+  const totalInches = Math.round((cm / 2.54) * 1) / 1;
+  const feet = Math.floor(totalInches / 12);
+  const inches = Math.round(totalInches - feet * 12);
+  return `${feet}'${inches}"`;
+}
+
+// A tiny safe getter
+const nonEmpty = (s?: string | null) => (s && s.trim().length ? s.trim() : undefined);
+
+// ---------- Page model ----------
+type Page =
+  | { kind: 'hero' }
+  | { kind: 'interests' }
+  | { kind: 'section'; section: 'about' | 'work' | 'edu' | 'basics'; sectionItemIndex?: number };
+
+function buildPages(c: Candidate): Page[] {
+  const pages: Page[] = [];
+
+  // 1) Hero page always first
+  pages.push({ kind: 'hero' });
+
+  // 2) Interests page if we have something to show (text-only by request)
+  const hasInterests = (c.profile?.interests?.length ?? 0) > 0 || nonEmpty(c.profile?.bio);
+  if (hasInterests) pages.push({ kind: 'interests' });
+
+  // 3) Some lightweight sections
+  if (c.profile?.jobTitle || c.profile?.company) pages.push({ kind: 'section', section: 'work' });
+  if (c.profile?.education) pages.push({ kind: 'section', section: 'edu' });
+  if (c.profile?.gender || c.profile?.age || c.profile?.city || c.profile?.heightCm)
+    pages.push({ kind: 'section', section: 'basics' });
+  if (nonEmpty(c.profile?.bio)) pages.push({ kind: 'section', section: 'about' });
+
+  return pages;
+}
+
+// ---------- Motion configs (FM v12) ----------
+const CB_EASE: Easing = [0.22, 1, 0.36, 1];
+
+const pageVariants: Variants = {
   enter: (dir: number) => ({
     y: dir > 0 ? 40 : -40,
     opacity: 0,
     filter: 'blur(4px)',
-    transition: { duration: 0.22, ease: [0.22, 1, 0.36, 1] }
+    transition: { duration: 0.22, ease: CB_EASE },
   }),
   center: {
     y: 0,
     opacity: 1,
     filter: 'blur(0px)',
-    transition: { duration: 0.26, ease: [0.22, 1, 0.36, 1] }
+    transition: { duration: 0.26, ease: CB_EASE },
   },
   exit: (dir: number) => ({
     y: dir > 0 ? -40 : 40,
     opacity: 0,
     filter: 'blur(4px)',
-    transition: { duration: 0.22, ease: [0.22, 1, 0.36, 1] }
-  })
+    transition: { duration: 0.22, ease: CB_EASE },
+  }),
 };
 
-export default function SwipeDeck({
-  cards,
-  token,
-  onEmpty,
-  onSwiped,
-}: {
-  cards: Candidate[];
-  token: string;
-  onEmpty?: () => void;
-  onSwiped?: (id: string, liked: boolean) => void;
-}) {
+const swipeConfidenceThreshold = 500; // px*velocity
+
+// ---------- Component ----------
+export default function SwipeDeck({ cards, token, onEmpty, onSwiped }: SwipeDeckProps) {
   const [index, setIndex] = useState(0);
   const [pageIndex, setPageIndex] = useState(0);
-  const [pageDir, setPageDir] = useState(0); // -1 up, +1 down
-  const [sectionsByUser, setSectionsByUser] = useState<Record<string, Section[]>>({});
-  const [loadingSections, setLoadingSections] = useState<Record<string, boolean>>({});
-  const [reaction, setReaction] = useState<null | 'like' | 'nope'>(null);
+  const [pageDir, setPageDir] = useState(1); // for vertical page transitions
+  const x = useMotionValue(0);
+  const rotate = useTransform(x, [-300, 0, 300], [-10, 0, 10]);
+  const opacity = useTransform(x, [-300, 0, 300], [0.6, 1, 0.6]);
 
   const current = cards[index];
+  const pages = useMemo(() => (current ? buildPages(current) : []), [current]);
 
-  // Per-user sections (fetched once per user)
   useEffect(() => {
-    if (!current) return;
-    const uid = current.id;
-    if (sectionsByUser[uid] || loadingSections[uid]) return;
-    setLoadingSections(m => ({ ...m, [uid]: true }));
-    api<Section[]>(`/sections/${uid}`, { token })
-      .then(list => {
-        const sorted = [...(list || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-        setSectionsByUser(m => ({ ...m, [uid]: sorted }));
-      })
-      .catch(() => setSectionsByUser(m => ({ ...m, [uid]: [] })))
-      .finally(() => setLoadingSections(m => ({ ...m, [uid]: false })));
-  }, [current, token, sectionsByUser, loadingSections]);
+    // reset page when card changes
+    setPageIndex(0);
+    setPageDir(1);
+    x.set(0);
+  }, [index, x]);
 
-  // Build pages: hero, each section (card items expand), then interests page
-  const pages = useMemo(() => {
-    if (!current) return [];
-    const secs = sectionsByUser[current.id] || [];
-    const built: Array<{ kind: 'hero' | 'section' | 'interests'; section?: Section; sectionItemIndex?: number }> = [];
-    built.push({ kind: 'hero' });
-    for (const s of secs) {
-      if (s.type === 'card') {
-        const items = Array.isArray((s.content as SectionContentCard | undefined)?.items)
-          ? (s.content as SectionContentCard).items!
-          : [];
-        items.forEach((_, i) => built.push({ kind: 'section', section: s, sectionItemIndex: i }));
-      } else {
-        built.push({ kind: 'section', section: s });
-      }
-    }
-    built.push({ kind: 'interests' });
-    if (pageIndex > built.length - 1) setPageIndex(built.length - 1);
-    return built;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current, sectionsByUser]);
+  useEffect(() => {
+    if (!current && onEmpty) onEmpty();
+  }, [current, onEmpty]);
 
-  // Horizontal swipe values (applied to the whole page incl. image)
-  const x = useMotionValue(0);
-  const rotate = useTransform(x, [-400, 0, 400], [-10, 0, 10]);
-  const resetMotion = useCallback(() => x.set(0), [x]);
-
-  const showReaction = (kind: 'like' | 'nope') => {
-    setReaction(kind);
-    setTimeout(() => setReaction(null), 650);
-  };
-
-  const doSwipe = useCallback(
-    async (liked: boolean) => {
+  const paginate = useCallback(
+    (dir: 1 | -1) => {
       if (!current) return;
-      showReaction(liked ? 'like' : 'nope');
-      try {
-        await api('/swipes', {
-          token,
-          method: 'POST',
-          body: JSON.stringify({ targetId: current.id, liked }),
-        });
-      } catch {
-        /* ignore */
-      } finally {
-        onSwiped?.(current.id, liked);
-        setIndex(i => {
-          const next = i + 1;
-          if (next >= cards.length) {
-            onEmpty?.();
-            return i;
-          }
-          return next;
-        });
-        setPageIndex(0);
-        resetMotion();
+      const next = index + dir;
+      if (next < 0) return;
+      if (next >= cards.length) {
+        setIndex(cards.length); // out of range -> triggers onEmpty effect
+      } else {
+        setIndex(next);
       }
     },
-    [current, token, cards.length, onSwiped, onEmpty, resetMotion]
+    [cards.length, current, index]
   );
 
-  const onDragEnd = (_: MouseEvent | TouchEvent, info: PanInfo) => {
-    const threshold = 140;
-    if (info.offset.x > threshold) {
-      x.set(400);
-      void doSwipe(true);
-    } else if (info.offset.x < -threshold) {
-      x.set(-400);
-      void doSwipe(false);
-    } else {
-      resetMotion();
+  const pageNext = useCallback(() => {
+    if (!pages.length) return;
+    if (pageIndex < pages.length - 1) {
+      setPageDir(1);
+      setPageIndex((p) => p + 1);
     }
-  };
+  }, [pageIndex, pages.length]);
 
-  // Paging helpers with direction
-  const goPage = (next: number, dir: number) => {
-    setPageDir(dir);
-    setPageIndex(prev => Math.max(0, Math.min((pages.length || 1) - 1, next)));
-  };
-  const goNextPage = () => goPage(pageIndex + 1, +1);
-  const goPrevPage = () => goPage(pageIndex - 1, -1);
+  const pagePrev = useCallback(() => {
+    if (!pages.length) return;
+    if (pageIndex > 0) {
+      setPageDir(-1);
+      setPageIndex((p) => p - 1);
+    }
+  }, [pageIndex, pages.length]);
 
-  // Keyboard controls
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+  const onDragEnd = useCallback(
+    async (_: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) => {
+      const swipe = Math.abs(info.offset.x) * info.velocity.x;
+      if (swipe > swipeConfidenceThreshold) {
+        // right = like
+        await handleSwipe('right');
+      } else if (swipe < -swipeConfidenceThreshold) {
+        // left = pass
+        await handleSwipe('left');
+      } else {
+        // snap back
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  const handleSwipe = useCallback(
+    async (direction: 'left' | 'right') => {
       if (!current) return;
-      if (e.key === 'ArrowRight') { e.preventDefault(); void doSwipe(true); }
-      if (e.key === 'ArrowLeft')  { e.preventDefault(); void doSwipe(false); }
-      if (e.key === 'ArrowDown')  { e.preventDefault(); goNextPage(); }
-      if (e.key === 'ArrowUp')    { e.preventDefault(); goPrevPage(); }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [current, doSwipe]);
 
-  // Wheel paging (throttled)
-  const wheelRef = useRef<number>(0);
-  const onWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+      try {
+        if (direction === 'right') {
+          await api(token).post(`/likes/${current.id}`, {});
+        } else {
+          await api(token).post(`/passes/${current.id}`, {});
+        }
+      } catch {
+        // ignore network failure for now; UX could be improved with offline queue
+      } finally {
+        onSwiped?.({ id: current.id, direction });
+        paginate(1);
+      }
+    },
+    [current, paginate, token, onSwiped]
+  );
+
+  // Wheel to change page (vertical)
+  const wheelRef = useRef(0);
+  const onWheel = (e: React.WheelEvent) => {
     const now = Date.now();
-    if (now - (wheelRef.current || 0) < 250) return;
-    if (Math.abs(e.deltaY) < 10) return;
+    if (now - wheelRef.current < 250) return; // throttle
     wheelRef.current = now;
-    if (e.deltaY > 0) goNextPage();
-    else goPrevPage();
+    if (e.deltaY > 0) pageNext();
+    else pagePrev();
   };
 
-  // ---- Renderers ----
+  // ---------- Renderers ----------
   const renderHero = (c: Candidate) => {
     const photo = bestPhoto(c);
-    const nameAge = `${c.name || c.email.split('@')[0]}${c.profile?.age ? `, ${c.profile.age}` : ''}`;
-    const inst = c.profile?.institution;
-    return (
-      <TwoColCard
-        photoUrl={photo}
-        right={
-          <div className="space-y-3">
-            <h2 className="text-2xl md:text-3xl font-semibold">{nameAge}</h2>
-            {inst && <div className="text-neutral-300">{inst}</div>}
-            {c.profile?.bio && <p className="text-neutral-300 leading-relaxed">{c.profile.bio}</p>}
-          </div>
-        }
-      />
-    );
-  };
+    const nameAge = `${nonEmpty(c.name) || c.email}${c.profile?.age ? `, ${c.profile.age}` : ''}`;
+    const city = nonEmpty(c.profile?.city);
 
-  const renderSection = (c: Candidate, s: Section, itemIndex?: number) => {
-    if (s.type === 'text') {
-      const text = (s.content as SectionContentText | undefined)?.body ?? '';
-      return (
-        <TwoColCard
-          photoUrl={bestPhoto(c)}
-          right={
-            <div className="space-y-3">
-              <h3 className="text-xl font-semibold">{s.title}</h3>
-              <p className="text-neutral-300 whitespace-pre-wrap">{text}</p>
-            </div>
-          }
-        />
-      );
-    }
-    if (s.type === 'gallery') {
-      const imgs: string[] = Array.isArray((s.content as SectionContentGallery | undefined)?.images)
-        ? ((s.content as SectionContentGallery).images as string[])
-        : [];
-      const img = imgs[0] || bestPhoto(c);
-      return (
-        <TwoColCard
-          photoUrl={img}
-          right={
-            <div className="space-y-3">
-              <h3 className="text-xl font-semibold">{s.title}</h3>
-              <div className="grid grid-cols-2 gap-2">
-                {imgs.map((u, i) => (
-                  <div key={i} className="relative w-full aspect-[4/3] overflow-hidden rounded-lg border border-neutral-800">
-                    <Image src={u} alt="" fill sizes="(max-width: 768px) 50vw, 33vw" className="object-cover" />
-                  </div>
-                ))}
-              </div>
-            </div>
-          }
-        />
-      );
-    }
-    if (s.type === 'card') {
-      const items = Array.isArray((s.content as SectionContentCard | undefined)?.items)
-        ? (s.content as SectionContentCard).items!
-        : [];
-      const it = typeof itemIndex === 'number' ? items[itemIndex] : items[0];
-      const img = it?.image || bestPhoto(c);
-      const text = it?.text || '';
-      return (
-        <TwoColCard
-          photoUrl={img}
-          right={
-            <div className="space-y-3">
-              <h3 className="text-xl font-semibold">{s.title}</h3>
-              {text && <p className="text-neutral-300 whitespace-pre-wrap">{text}</p>}
-            </div>
-          }
-        />
-      );
-    }
     return (
-      <TwoColCard
-        photoUrl={bestPhoto(c)}
-        right={
-          <div className="space-y-2">
-            <h3 className="text-xl font-semibold">{s.title}</h3>
-            <p className="text-neutral-400 text-sm">Unsupported section type.</p>
-          </div>
-        }
-      />
-    );
-  };
+      <div className="flex flex-col gap-3">
+        <div className="relative w-full aspect-[4/5] overflow-hidden rounded-2xl bg-neutral-800">
+          {photo ? (
+            <Image
+              src={photo}
+              alt={nameAge}
+              fill
+              priority
+              className="object-cover"
+              sizes="(max-width: 768px) 100vw, 50vw"
+            />
+          ) : (
+            <div className="flex items-center justify-center w-full h-full text-neutral-400">
+              No photo
+            </div>
+          )}
+        </div>
 
-  const renderInterests = (c: Candidate) => {
-    const interests = c.profile?.interests ?? [];
-    return (
-      // text-only final page per your spec (no image here)
-      <div className="mx-auto h-full max-w-7xl">
-        <div className="h-full rounded-xl overflow-hidden border border-neutral-800 bg-neutral-900 p-6 text-neutral-100">
-          <div className="space-y-4 max-w-3xl">
-            {c.profile?.bio && (
-              <>
-                <h3 className="text-xl font-semibold">About</h3>
-                <p className="text-neutral-300 whitespace-pre-wrap">{c.profile.bio}</p>
-              </>
-            )}
-            <h3 className="text-xl font-semibold">Interests</h3>
-            {interests.length ? (
-              <div className="flex flex-wrap gap-2">
-                {interests.map(i => (
-                  <span key={i} className="px-3 py-1.5 rounded-full border border-neutral-700 bg-neutral-900 text-neutral-100">
-                    {i}
-                  </span>
-                ))}
-              </div>
-            ) : (
-              <p className="text-neutral-400">No interests added.</p>
-            )}
-          </div>
+        <div className="px-1">
+          <div className="text-xl font-semibold">{nameAge}</div>
+          {city && <div className="text-sm text-neutral-400">{city}</div>}
         </div>
       </div>
     );
   };
 
-  // ---- Empty state ----
+  // Interests page — text only (no image)
+  const renderInterests = (c: Candidate) => {
+    const bio = nonEmpty(c.profile?.bio);
+    const interests = c.profile?.interests ?? [];
+
+    return (
+      <div className="flex flex-col gap-4">
+        {bio && (
+          <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+            <div className="text-sm leading-relaxed text-neutral-200">{bio}</div>
+          </div>
+        )}
+
+        {interests.length > 0 && (
+          <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+            <div className="mb-2 text-sm font-medium text-neutral-300">Interests</div>
+            <div className="flex flex-wrap gap-2">
+              {interests.map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full border border-neutral-700 px-3 py-1 text-xs text-neutral-200"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderSection = (c: Candidate, section: 'about' | 'work' | 'edu' | 'basics') => {
+    if (section === 'about') {
+      const bio = nonEmpty(c.profile?.bio);
+      return bio ? (
+        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+          <div className="text-sm leading-relaxed text-neutral-200 whitespace-pre-wrap">{bio}</div>
+        </div>
+      ) : (
+        <div className="text-neutral-400 text-sm">No bio provided.</div>
+      );
+    }
+
+    if (section === 'work') {
+      const jt = nonEmpty(c.profile?.jobTitle);
+      const co = nonEmpty(c.profile?.company);
+      return (
+        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+          <div className="text-sm text-neutral-200">
+            {jt ? <span className="font-medium">{jt}</span> : 'Job not added'}
+            {co ? <span className="text-neutral-400"> · {co}</span> : ''}
+          </div>
+        </div>
+      );
+    }
+
+    if (section === 'edu') {
+      const edu = nonEmpty(c.profile?.education);
+      return (
+        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+          <div className="text-sm text-neutral-200">{edu ?? 'Education not added'}</div>
+        </div>
+      );
+    }
+
+    // basics
+    const gender = nonEmpty(c.profile?.gender);
+    const city = nonEmpty(c.profile?.city);
+    const age = c.profile?.age ? `${c.profile.age}` : undefined;
+    const height = cmToFeetInches(c.profile?.heightCm);
+
+    const rows = [
+      { k: 'Age', v: age },
+      { k: 'Gender', v: gender },
+      { k: 'Height', v: height },
+      { k: 'City', v: city },
+    ].filter((r) => !!r.v);
+
+    return rows.length ? (
+      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+        <dl className="grid grid-cols-2 gap-3 text-sm">
+          {rows.map((r) => (
+            <div key={r.k} className="flex items-center justify-between gap-3">
+              <dt className="text-neutral-400">{r.k}</dt>
+              <dd className="text-neutral-100">{r.v}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+    ) : (
+      <div className="text-neutral-400 text-sm">No basic details yet.</div>
+    );
+  };
+
   if (!current) {
-    return <div className="text-neutral-400 text-center py-16">No more profiles nearby.</div>;
+    return (
+      <div className="w-full h-full flex items-center justify-center text-neutral-400">
+        No more cards
+      </div>
+    );
   }
 
   const content =
@@ -329,8 +354,9 @@ export default function SwipeDeck({
       ? renderHero(current)
       : pages[pageIndex]?.kind === 'interests'
       ? renderInterests(current)
-      : renderSection(current, pages[pageIndex].section!, pages[pageIndex].sectionItemIndex);
+      : renderSection(current, (pages[pageIndex] as Extract<Page, { kind: 'section' }>).section);
 
+  // ---------- UI ----------
   return (
     <div className="w-full h-full px-4 md:px-6" onWheel={onWheel}>
       {/* Page dots */}
@@ -339,90 +365,90 @@ export default function SwipeDeck({
           <button
             key={i}
             aria-label={`Go to page ${i + 1}`}
-            onClick={() => goPage(i, i > pageIndex ? +1 : -1)}
-            className={`h-1.5 rounded-full transition-all ${i === pageIndex ? 'bg-white w-8' : 'bg-neutral-600 w-3'}`}
+            onClick={() => {
+              setPageDir(i > pageIndex ? 1 : -1);
+              setPageIndex(i);
+            }}
+            className={`h-1.5 rounded-full transition-all ${
+              i === pageIndex ? 'w-4 bg-neutral-100' : 'w-2 bg-neutral-600'
+            }`}
           />
         ))}
       </div>
 
-      {/* Animated page container */}
-      <div className="relative h-[calc(100vh-6rem)]">
-        <AnimatePresence initial={false} mode="wait" custom={pageDir}>
-          <motion.div
-            key={`${current.id}-${pageIndex}`}
-            custom={pageDir}
-            variants={pageVariants}
-            initial="enter"
-            animate="center"
-            exit="exit"
-            className="absolute inset-0"
-          >
-            {/* Draggable layer wraps the entire page, so the IMAGE is draggable too */}
+      <div className="mt-3 grid grid-cols-1 md:grid-cols-5 gap-4">
+        {/* Left: photo/primary content with swipe */}
+        <div className="md:col-span-3">
+          <AnimatePresence custom={pageDir} mode="popLayout">
             <motion.div
+              key={`${current.id}-${pageIndex}`}
+              custom={pageDir}
+              variants={pageVariants}
+              initial="enter"
+              animate="center"
+              exit="exit"
+              style={{ rotate, opacity }}
               drag="x"
-              style={{ x, rotate }}
-              dragMomentum={false}
+              dragConstraints={{ left: 0, right: 0 }}
+              dragElastic={0.9}
               onDragEnd={onDragEnd}
-              dragElastic={0.2}
-              className="h-full"
+              className="select-none"
             >
-              {/* Reaction overlay */}
-              <AnimatePresence>
-                {reaction && (
-                  <motion.div
-                    key={reaction}
-                    initial={{ scale: 0.6, opacity: 0, y: 20 }}
-                    animate={{ scale: 1.1, opacity: 1, y: 0 }}
-                    exit={{ scale: 0.8, opacity: 0, y: -10 }}
-                    transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-                    className="pointer-events-none absolute inset-0 flex items-center justify-center z-20"
-                  >
-                    <div className={`text-7xl ${reaction === 'like' ? 'text-pink-500' : 'text-red-500'}`}>
-                      {reaction === 'like' ? '💖' : '✖️'}
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
               {content}
             </motion.div>
-          </motion.div>
-        </AnimatePresence>
-      </div>
+          </AnimatePresence>
+        </div>
 
-      <div className="mt-3 text-center text-xs text-neutral-500">
-        ← / → to pass/like • ↑ / ↓ to switch pages • Drag horizontally anywhere on the card
-      </div>
-    </div>
-  );
-}
+        {/* Right: actions & meta */}
+        <div className="md:col-span-2">
+          <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4 md:p-6 text-neutral-100">
+            <div className="flex items-center gap-3">
+              <button
+                className="h-11 w-11 rounded-full bg-neutral-800 hover:bg-neutral-700 border border-neutral-700"
+                onClick={() => handleSwipe('left')}
+                aria-label="Pass"
+                title="Pass"
+              >
+                ✖
+              </button>
+              <button
+                className="h-12 w-12 rounded-full bg-neutral-100 text-neutral-900 hover:bg-white"
+                onClick={() => handleSwipe('right')}
+                aria-label="Like"
+                title="Like"
+              >
+                ❤
+              </button>
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  className="text-sm px-3 py-1.5 rounded-lg border border-neutral-700 hover:bg-neutral-800"
+                  onClick={pagePrev}
+                >
+                  Prev
+                </button>
+                <button
+                  className="text-sm px-3 py-1.5 rounded-lg border border-neutral-700 hover:bg-neutral-800"
+                  onClick={pageNext}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
 
-// ---------- Two-column Card ----------
-function TwoColCard({ photoUrl, right }: { photoUrl?: string; right: React.ReactNode }) {
-  const src = photoUrl || 'https://picsum.photos/1200/1600';
-  return (
-    <div className="mx-auto h-full max-w-7xl">
-      <div className="grid h-full grid-cols-1 md:grid-cols-12 gap-4 md:gap-6">
-        {/* Image wider (8/12) */}
-        <div className="md:col-span-8 h-full">
-          <div className="h-full w-full rounded-xl overflow-hidden border border-neutral-800 bg-neutral-900">
-            <div className="relative h-full w-full md:aspect-[3/4]">
-              <Image src={src} alt="" fill priority sizes="(max-width: 768px) 100vw, 60vw" className="object-cover" />
+            {/* Meta card */}
+            <div className="mt-4 space-y-2 text-sm text-neutral-300">
+              <div>
+                <span className="text-neutral-500">User ID:</span> {current.id}
+              </div>
+              {current.profile?.city && (
+                <div>
+                  <span className="text-neutral-500">Based in:</span> {current.profile.city}
+                </div>
+              )}
             </div>
           </div>
         </div>
-        {/* Text (4/12) */}
-        <div className="md:col-span-4 h-full">
-          <div className="h-full w-full rounded-xl overflow-hidden border border-neutral-800 bg-neutral-900 p-4 md:p-6 text-neutral-100">
-            {right}
-          </div>
-        </div>
       </div>
     </div>
   );
-}
-
-function bestPhoto(c: Candidate): string | undefined {
-  const p = [...(c.photos ?? [])].sort((a, b) => a.order - b.order)[0];
-  return p?.url;
 }
