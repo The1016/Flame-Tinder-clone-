@@ -28,3 +28,20 @@ function joinUrl(base: string, path: string) {
   const p = path.startsWith('/') ? path : `/${path}`;
   return b ? `${b}${p}` : p; // falls back to relative if BASE not set (local proxy)
 }
+
+export const register = async (data: { email: string; password: string; name: string }) => {
+  const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/register`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || 'Registration failed');
+  }
+
+  return response.json();
+};
