@@ -30,18 +30,18 @@ function joinUrl(base: string, path: string) {
 }
 
 export const register = async (data: { email: string; password: string; name: string }) => {
-  const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/register`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(data),
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Registration failed');
+  console.log('Attempting registration with:', data);
+  console.log('API URL:', process.env.NEXT_PUBLIC_API_URL);
+  
+  try {
+    const result = await api('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+    console.log('Registration response:', result);
+    return result;
+  } catch (error) {
+    console.error('Registration error:', error);
+    throw error;
   }
-
-  return response.json();
 };
